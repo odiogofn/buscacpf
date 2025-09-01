@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Buscar CPF dentro de ZIPs (XML)</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;max-width:980px;margin:24px auto;padding:16px}
+    h1{font-size:20px;margin-bottom:6px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+    input[type=text]{padding:8px;font-size:14px;width:240px}
+    button{padding:8px 12px;font-size:14px}
+    .results{margin-top:12px}
+    .file-item{padding:8px;border-radius:6px;border:1px solid #ddd;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+    pre{max-height:320px;overflow:auto;background:#f7f7f7;padding:12px;border-radius:6px}
+    .badge{background:#eee;padding:4px 8px;border-radius:999px;font-size:12px}
+    .controls{display:flex;gap:8px}
+    .small{font-size:13px}
+  </style>
+</head>
+<body>
+  <h1>Buscar CPF dentro de arquivos ZIP contendo XML</h1>
+  <p>Arraste/selicione arquivos .zip (pode selecionar vários). Digite o CPF (com ou sem pontuação). O script procura o CPF dentro dos arquivos XML e mostra apenas os que contêm o CPF. Você pode baixar os XMLs encontrados em um ZIP.</p>
+
+  <div class="row">
+    <input id="zipFiles" type="file" accept=".zip" multiple />
+    <input id="cpfInput" type="text" placeholder="Digite o CPF (ex: 123.456.789-09)" />
+    <button id="searchBtn">Pesquisar</button>
+    <button id="downloadAll" disabled>Baixar encontrados (zip)</button>
+  </div>
+
+  <div class="row small">
+    <label><input id="searchAnywhere" type="checkbox" checked /> Buscar em qualquer lugar do XML (recomendado)</label>
+    <label><input id="matchTagOnly" type="checkbox" /> Buscar apenas em tags/atributos CPF (ex: &lt;CPF&gt;..&lt;/CPF&gt; ou cpf="...")</label>
+  </div>
+
+  <div id="progress" class="small"></div>
+  <div id="results" class="results"></div>
+
+  <!-- Modal preview simple -->
+  <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);align-items:center;justify-content:center;padding:20px">
+    <div style="background:#fff;border-radius:8px;max-width:920px;width:100%;padding:16px;max-height:90vh;overflow:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <strong id="modalTitle"></strong>
+        <button id="closeModal">Fechar</button>
+      </div>
+      <pre id="modalContent"></pre>
+    </div>
+  </div>
+
+  <!-- Dependências: JSZip + FileSaver -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+  <script>
+    // Utilidades
+    const $ = id => document.getElementById(id);
+    const normalizeCPF = s => (s||'').toString().replace(/\D/g,'');
+
+    async function readFileAsArrayBuffer(file){
+      return await file.arrayBuffer();
+    }
+
+    function normalizeXmlContent(text){
+      // remove espaços repetidos e quebras para busca mais simples
+      return text.replace(/\r|\n/g,' ').replace(/>\s+</g,'><');
+    }
+
+    function contentContainsCPFAnywhere(content, cpfDigits){
+      // remover tudo que nao digito e procurar a sequência, evita problemas com pontuação
+      const onlyDigits = content.replace(/\D/g,'');
+      return onlyDigits.includes(cpfDigits);
+    }
+
+    function contentContainsCPFInTag(content, cpfDigits){
+      // tenta pares comuns: <CPF>...</CPF>, <cpf>..</cpf>, cpf="..."
+      const reTag = new RegExp(`<\\s*(cpf|CPF)\\s*>\\s*([^<]+?)\\s*<\\/\\s*(cpf|CPF)\\s*>`);
+      const reAttr = new RegExp(`(cpf)\\s*=\\s*\"([^\"]{6,20})\"`,'i');
+      let m;
+      if((m = content.match(reTag))){
+        if(normalizeCPF(m[2]) === cpfDigits) return true;
+      }
+      // procurar múltiplas ocorrências de tags com letras misturadas
+      const tagGlobal = content.match(/<\s*(cpf|CPF)\s*>([\s\S]*?)<\s*\/\s*(cpf|CPF)\s*>/g);
+      if(tagGlobal){
+        for(const t of tagGlobal){
+          const inner = t.replace(/<[^>]+>/g,'');
+          if(normalizeCPF(inner) === cpfDigits) return true;
+        }
+      }
+      // attributes
+      const attrGlobal = content.match(/(cpf|CPF)\s*=\s*\"([^\"]+)\"/g);
+      if(attrGlobal){
+        for(const a of attrGlobal){
+          const val = a.split('=')[1].replace(/\"/g,'').trim();
+          if(normalizeCPF(val) === cpfDigits) return true;
+        }
+      }
+      // fallback: procurar qualquer sequência de 11 dígitos que combine
+      const digits = content.match(/\d{11}/g);
+      if(digits){
+        return digits.some(d => d === cpfDigits);
+      }
+      return false;
+    }
+
+    async function processZipFile(file, cpfDigits, opts){
+      const buffer = await readFileAsArrayBuffer(file);
+      const zip = await JSZip.loadAsync(buffer);
+      const matched = [];
+
+      // função recursiva para percorrer pastas e arquivos
+      async function walk(folder, path = ''){
+        for(const relativePath in folder.files){
+          const entry = folder.files[relativePath];
+          if(entry.dir) continue;
+          const name = entry.name || relativePath;
+          const fullPath = path ? `${path}/${name}` : name;
+          // se for zip dentro do zip - opcionalmente tratar
+          if(name.toLowerCase().endsWith('.zip')){
+            // ler conteúdo do zip interno
+            const innerBuf = await entry.async('arraybuffer');
+            const innerZip = await JSZip.loadAsync(innerBuf);
+            await walk(innerZip, fullPath);
+            continue;
+          }
+          if(name.toLowerCase().endsWith('.xml')){
+            const text = await entry.async('text');
+            const normalized = normalizeXmlContent(text);
+            let found = false;
+            if(opts.matchTagOnly){
+              found = contentContainsCPFInTag(normalized, cpfDigits);
+            } else {
+              found = contentContainsCPFAnywhere(normalized, cpfDigits);
+            }
+            if(found){
+              matched.push({fileName: fullPath, content: text});
+            }
+          }
+        }
+      }
+
+      await walk(zip);
+      return matched;
+    }
+
+    $('searchBtn').addEventListener('click', async ()=>{
+      const files = $('zipFiles').files;
+      const cpfRaw = $('cpfInput').value.trim();
+      if(!files || files.length===0){ alert('Selecione pelo menos um arquivo .zip'); return; }
+      if(!cpfRaw){ alert('Digite o CPF'); return; }
+      const cpfDigits = normalizeCPF(cpfRaw);
+      if(cpfDigits.length !== 11){ if(!confirm('CPF não tem 11 dígitos após normalização. Continuar a busca?')) return; }
+
+      const opts = { matchTagOnly: $('matchTagOnly').checked };
+      $('results').innerHTML = '';
+      $('progress').textContent = 'Iniciando...';
+      const allMatches = [];
+
+      for(let i=0;i<files.length;i++){
+        const f = files[i];
+        $('progress').textContent = `Processando ${f.name} (${i+1}/${files.length})...`;
+        try{
+          const matched = await processZipFile(f, cpfDigits, opts);
+          matched.forEach(m=> m.sourceZip = f.name);
+          allMatches.push(...matched);
+        }catch(err){
+          console.error('Erro processando', f.name, err);
+          const div = document.createElement('div');
+          div.textContent = `Erro ao processar ${f.name}: ${err.message}`;
+          $('results').appendChild(div);
+        }
+      }
+
+      $('progress').textContent = `Finalizado. Encontrados: ${allMatches.length} arquivo(s) XML contendo o CPF.`;
+      renderResults(allMatches);
+
+      // habilitar botão de download se houver arquivos
+      $('downloadAll').disabled = allMatches.length === 0;
+      // armazenar para download
+      window._lastFound = allMatches;
+    });
+
+    function renderResults(list){
+      const container = $('results');
+      container.innerHTML = '';
+      if(list.length===0){ container.innerHTML = '<div>Nenhum XML encontrado com esse CPF.</div>'; return; }
+      for(const item of list){
+        const div = document.createElement('div');
+        div.className = 'file-item';
+        const left = document.createElement('div');
+        left.innerHTML = `<strong>${escapeHtml(item.fileName)}</strong><div class="small">origem: ${escapeHtml(item.sourceZip || '')}</div>`;
+        const controls = document.createElement('div');
+        controls.className = 'controls';
+        const btnPreview = document.createElement('button');
+        btnPreview.textContent = 'Visualizar';
+        btnPreview.addEventListener('click', ()=> openModal(item.fileName, item.content));
+        const aDownload = document.createElement('a');
+        aDownload.textContent = 'Baixar XML';
+        aDownload.href = createDownloadHref(item.content, item.fileName);
+        aDownload.download = item.fileName.split('/').pop();
+        aDownload.style.textDecoration = 'none';
+        aDownload.style.padding = '8px 10px';
+        aDownload.style.border = '1px solid #ddd';
+        aDownload.style.borderRadius = '6px';
+        controls.appendChild(btnPreview);
+        controls.appendChild(aDownload);
+        div.appendChild(left);
+        div.appendChild(controls);
+        container.appendChild(div);
+      }
+    }
+
+    function createDownloadHref(text, filename){
+      const blob = new Blob([text], {type: 'application/xml'});
+      return URL.createObjectURL(blob);
+    }
+
+    $('downloadAll').addEventListener('click', async ()=>{
+      const found = window._lastFound || [];
+      if(found.length===0) return;
+      const zipOut = new JSZip();
+      // colocar todos dentro de uma pasta
+      for(const f of found){
+        // garantir nomes únicos
+        let name = f.fileName.split('/').pop();
+        // prefix with source zip
+        name = `${sanitizeFileName(f.sourceZip)}_${name}`;
+        zipOut.file(name, f.content);
+      }
+      $('progress').textContent = 'Gerando ZIP de download...';
+      const blob = await zipOut.generateAsync({type:'blob'});
+      saveAs(blob, `xmls_encontrados_${Date.now()}.zip`);
+      $('progress').textContent = `Download pronto. ${found.length} arquivo(s).`;
+    });
+
+    function sanitizeFileName(s){ return (s||'').replace(/[^a-zA-Z0-9_.-]/g,'_'); }
+
+    function openModal(title, content){
+      $('modalTitle').textContent = title;
+      $('modalContent').textContent = content;
+      $('modal').style.display = 'flex';
+    }
+    $('closeModal').addEventListener('click', ()=> $('modal').style.display = 'none');
+
+    function escapeHtml(s){
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+  </script>
+</body>
+</html>
